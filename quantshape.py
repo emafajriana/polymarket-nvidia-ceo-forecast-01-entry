@@ -76,11 +76,18 @@ import volmodel
 Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
 
 DEFAULT_PARAMS = {
-    "w_emp": 1.0, "sig_blend": 0.5, "sig_floor": 0.0004,
+    # v3 calibration: a 10% Gaussian component whose sigma is the
+    # market's own MAD-based sig1 alone (sig_blend 0.0) repairs the
+    # pooled empirical shape at short horizons, where its inner
+    # quantiles collapse onto the median; revert_tau 360 and a 0.8
+    # deviation scale for sub-0.02-priced markets (pb_s1) are the
+    # other round-3 changes.  Local scores vs v2 (0.258393 /
+    # 0.340938): official 0.256001, extra 0.341345.
+    "w_emp": 0.9, "sig_blend": 0.0, "sig_floor": 0.0004,
     "sig_cap": 0.02, "mid_scale": 0.62, "tail_scale": 0.62,
     "dn_tail_scale": 0.56, "dn_mid_scale": 1.15,
     "up_mid_scale": 0.78, "up_tail_scale": 0.47,
-    "med_shrink": 1.0, "revert": 0.05, "revert_tau": 180.0,
+    "med_shrink": 1.0, "revert": 0.05, "revert_tau": 360.0,
     "drift_cap": 0.05, "sum_shrink": 0.0,
     # Sum-reversion (forecast_case): whole-row shifts so the median
     # sum decays from the current price sum toward sum_target_inf.
@@ -94,6 +101,16 @@ DEFAULT_PARAMS = {
     #     ** act_gamma, activity measured over the last act_window prices.
     "act_window": 361, "act_gamma": 1.0,
     "act_clip_lo": 0.4, "act_clip_hi": 2.0,
+    # Horizon-dependent deviation scale: every deviation from the
+    # median is multiplied by clip((h / h_scale_ref) ** h_scale_pow,
+    # h_scale_lo, h_scale_hi).  pow 0.0 (default) = exactly 1.0 = off.
+    "h_scale_pow": 0.0, "h_scale_ref": 60.0,
+    "h_scale_lo": 0.6, "h_scale_hi": 2.0,
+    # Price-bucket deviation scale: multiplier chosen by the market's
+    # last price x: x < pb_t1 -> pb_s1; pb_t1 <= x < pb_t2 -> pb_s2;
+    # x >= pb_t2 -> pb_s3.  All scales 1.0 (default) = off.
+    "pb_t1": 0.02, "pb_t2": 0.08,
+    "pb_s1": 0.8, "pb_s2": 1.0, "pb_s3": 1.0,
 }
 
 _MED = 2  # median position in a five-quantile row
@@ -185,9 +202,24 @@ def rows_for_market(prices, horizon=240,
     revert, revert_tau = float(p["revert"]), float(p["revert_tau"])
     gap24, cap = mean24 - x, abs(float(p["drift_cap"]))
 
+    # Price-bucket deviation multiplier for this market (1.0 = off).
+    if x < float(p["pb_t1"]):
+        pb_mult = float(p["pb_s1"])
+    elif x < float(p["pb_t2"]):
+        pb_mult = float(p["pb_s2"])
+    else:
+        pb_mult = float(p["pb_s3"])
+    hs_pow = float(p["h_scale_pow"])
+    hs_ref = float(p["h_scale_ref"]) or 60.0
+    hs_lo, hs_hi = float(p["h_scale_lo"]), float(p["h_scale_hi"])
+
     rows = []
     for h in range(1, horizon + 1):
         sqrt_h = math.sqrt(h)
+        if hs_pow != 0.0:
+            hs_mult = min(hs_hi, max(hs_lo, (h / hs_ref) ** hs_pow))
+        else:
+            hs_mult = 1.0
         if shared is not None:
             s_sqrt_anchors, s_dq, s_f, act_mult = shared
             emp = [v * s_f for v in _empirical_at(sqrt_h, s_sqrt_anchors, s_dq)]
@@ -222,7 +254,8 @@ def rows_for_market(prices, horizon=240,
                         else p.get("up_tail_scale")
                 if side is not None:
                     scale = side
-                changes[k] = med + float(scale) * act_mult * (changes[k] - med)
+                changes[k] = med + float(scale) * act_mult * hs_mult \
+                    * pb_mult * (changes[k] - med)
 
         row, running = [], None
         for k in range(n_tau):  # add x, monotonise, clamp, round
