@@ -1,0 +1,261 @@
+"""Quantile forecast shaping for Polymarket-style Yes prices.
+
+Approach: ``volmodel.market_stats`` gives, per market, the last
+price ``x``, anchor horizons with empirical quantiles of the price
+changes over each anchor, a robust 1-minute volatility ``sig1``,
+and trailing means.  For each horizon minute ``h`` this module:
+
+1. interpolates the empirical change quantiles linearly in
+   ``sqrt(h)`` between bracketing anchors (nearest anchor outside
+   the range) -- square-root time matches diffusion scaling;
+2. builds Gaussian change quantiles from one effective sigma,
+   blending the sigma implied by the largest anchor's 5%-95%
+   spread with ``sig1``, clamped to ``[sig_floor, sig_cap]``;
+3. averages empirical and Gaussian quantiles, shrinks the median,
+   optionally pulls it toward the 24h mean, and caps its drift;
+4. rescales the inner (25%/75%) and outer (5%/95%) deviations
+   from the median separately, adds ``x``, then forces each row
+   non-decreasing, clamps it to [0, 1] and rounds to 6 decimals.
+
+``forecast_case`` does this for all markets in a case and, when
+``sum_shrink > 0``, shifts every median at a minute by a common
+amount toward restoring the sum of the current prices (useful
+for near-exhaustive market sets), keeping each shifted median
+inside its own row.
+
+In the calibrated configuration ``forecast_case`` replaces each
+market's own empirical quantiles with the case's pooled change
+distribution: every market's recent changes, divided by the level
+factor ``sqrt(max(p*(1-p), norm_floor))`` of the price they started
+from, are pooled across markets (``volmodel.pooled_change_quantiles``)
+and scaled back by each market's own level factor.  Each market's
+spread is further multiplied by its relative activity -- how much it
+has been moving lately versus the case average -- clipped and raised
+to ``act_gamma``.  With ``w_emp`` at 1.0 the Gaussian component is
+off and the pooled empirical distribution is the whole model.
+
+Parameters (``DEFAULT_PARAMS``):
+  w_emp -- weight on empirical quantiles (rest: Gaussian model).
+  sig_blend -- weight on anchor-implied sigma (rest: ``sig1``).
+  sig_floor / sig_cap -- bounds for the effective per-minute sigma.
+  mid_scale -- multiplier on 25%/75% deviations from the median.
+  tail_scale -- multiplier on 5%/95% deviations from the median.
+  med_shrink -- multiplier on the blended median change.
+  revert -- strength of median pull toward ``mean24`` (0 = off).
+  revert_tau -- minutes; pull grows as ``1 - exp(-h/revert_tau)``.
+  drift_cap -- absolute cap on the shaped median change.
+  sum_shrink -- cross-market median-sum adjustment (0 = off).
+
+Pure and deterministic: no randomness, no I/O, stdlib only.
+"""
+
+import bisect
+import math
+
+import volmodel
+
+# Standard normal quantiles at the five levels, as in volmodel.TAUS.
+Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
+
+DEFAULT_PARAMS = {
+    "w_emp": 1.0, "sig_blend": 0.5, "sig_floor": 0.0004,
+    "sig_cap": 0.02, "mid_scale": 0.62, "tail_scale": 0.62,
+    "med_shrink": 1.0, "revert": 0.0, "revert_tau": 180.0,
+    "drift_cap": 0.05, "sum_shrink": 0.0,
+    # Pooled cross-market empirical distribution (forecast_case):
+    # changes of every market in the case, level-normalised and pooled,
+    # replace each market's own change quantiles as the empirical part.
+    "pool_window": 1080, "norm_floor": 0.004,
+    # Per-market activity multiplier on the spread around the median:
+    # g = clip(sqrt(activity / mean activity), act_clip_lo, act_clip_hi)
+    #     ** act_gamma, activity measured over the last act_window prices.
+    "act_window": 361, "act_gamma": 1.0,
+    "act_clip_lo": 0.4, "act_clip_hi": 2.0,
+}
+
+_MED = 2  # median position in a five-quantile row
+
+
+def _merged(params):
+    out = dict(DEFAULT_PARAMS)
+    if params:
+        out.update(params)
+    return out
+
+
+def _z_for_taus(taus):
+    known = dict(zip(volmodel.TAUS, Z))
+    return [known.get(tau, Z[i] if i < len(Z) else 0.0)
+            for i, tau in enumerate(taus)]
+
+
+def _empirical_at(sqrt_h, sqrt_anchors, dq):
+    """Empirical change quantiles at ``sqrt_h`` (nearest outside)."""
+    if not dq:
+        return [0.0] * 5
+    if len(dq) == 1 or sqrt_h <= sqrt_anchors[0]:
+        return list(dq[0])
+    if sqrt_h >= sqrt_anchors[-1]:
+        return list(dq[-1])
+    j = bisect.bisect_right(sqrt_anchors, sqrt_h)  # bracket is j-1, j
+    lo, hi = dq[j - 1], dq[j]
+    span = sqrt_anchors[j] - sqrt_anchors[j - 1]
+    frac = 0.0 if span <= 0 else (sqrt_h - sqrt_anchors[j - 1]) / span
+    return [lo[k] + frac * (hi[k] - lo[k]) for k in range(len(lo))]
+
+
+def _anchor_sigma(anchors, dq, sig1):
+    """Per-sqrt-minute sigma implied by the largest anchor."""
+    if not anchors or not dq or not anchors[-1] or anchors[-1] <= 0:
+        return sig1
+    last = dq[-1]
+    if len(last) < 5 or last[4] - last[0] <= 0 or Z[4] - Z[0] <= 0:
+        return sig1
+    return (last[4] - last[0]) / (Z[4] - Z[0]) / math.sqrt(anchors[-1])
+
+
+def _clean(value):
+    rounded = round(value, 6)
+    return 0.0 if rounded == 0 else rounded  # also normalises -0.0
+
+
+def rows_for_market(prices, horizon=240,
+                    taus=(0.05, 0.25, 0.5, 0.75, 0.95), params=None,
+                    shared=None):
+    """Return ``horizon`` quantile rows for one market's prices.
+
+    ``shared`` optionally supplies the case-level pooled empirical
+    distribution as (sqrt_anchors, dq, level_f, act_g): its change
+    quantiles (in level-normalised units) replace the market's own as
+    the empirical part, scaled back by ``level_f`` for this market's
+    price level, and ``act_g`` additionally multiplies every deviation
+    from the median (the market's relative activity).
+    """
+    p = _merged(params)
+    taus = tuple(taus)
+    n_tau = len(taus)
+    if horizon <= 0:
+        return []
+    if not prices:
+        return [[0.0] * n_tau for _ in range(horizon)]
+
+    stats = volmodel.market_stats(prices)
+    x = float(stats["x"])
+    keep = min(len(stats.get("anchors") or []), len(stats.get("dq") or []))
+    anchors = list(stats["anchors"][:keep])
+    dq = [list(e) for e in stats["dq"][:keep]]
+    sqrt_anchors = [math.sqrt(a) if a > 0 else 0.0 for a in anchors]
+    sig1 = float(stats.get("sig1") or 0.0)
+    mean24 = float(stats.get("mean24", x))
+
+    # Effective sigma: blend anchor-implied with sig1, then clamp.
+    blend = float(p["sig_blend"])
+    sigma = blend * _anchor_sigma(anchors, dq, sig1) + (1 - blend) * sig1
+    lo_sig, hi_sig = float(p["sig_floor"]), float(p["sig_cap"])
+    if lo_sig > hi_sig:
+        lo_sig, hi_sig = hi_sig, lo_sig
+    sigma = max(lo_sig, min(hi_sig, sigma))
+
+    z_vals = _z_for_taus(taus)
+    w_emp, w_norm = float(p["w_emp"]), 1.0 - float(p["w_emp"])
+    med_idx = min(range(n_tau), key=lambda i: abs(taus[i] - 0.5))
+    revert, revert_tau = float(p["revert"]), float(p["revert_tau"])
+    gap24, cap = mean24 - x, abs(float(p["drift_cap"]))
+
+    rows = []
+    for h in range(1, horizon + 1):
+        sqrt_h = math.sqrt(h)
+        if shared is not None:
+            s_sqrt_anchors, s_dq, s_f, act_mult = shared
+            emp = [v * s_f for v in _empirical_at(sqrt_h, s_sqrt_anchors, s_dq)]
+        else:
+            act_mult = 1.0
+            emp = _empirical_at(sqrt_h, sqrt_anchors, dq)
+        if len(emp) < n_tau:  # pad/truncate to the requested width
+            emp += [emp[-1] if emp else 0.0] * (n_tau - len(emp))
+        emp = emp[:n_tau]
+        changes = [w_emp * emp[k] + w_norm * z_vals[k] * sigma * sqrt_h
+                   for k in range(n_tau)]
+
+        # Median: shrink, optional reversion pull, then drift cap.
+        pull = 1.0 - math.exp(-h / revert_tau) if revert_tau > 1e-12 else 1.0
+        med = float(p["med_shrink"]) * changes[med_idx] + gap24 * revert * pull
+        med = max(-cap, min(cap, med))
+        changes[med_idx] = med
+
+        # Rescale deviations from the median: near pair vs tails,
+        # times the market's relative-activity multiplier.
+        for k in range(n_tau):
+            if k != med_idx:
+                scale = p["mid_scale"] if abs(k - med_idx) == 1 else p["tail_scale"]
+                changes[k] = med + float(scale) * act_mult * (changes[k] - med)
+
+        row, running = [], None
+        for k in range(n_tau):  # add x, monotonise, clamp, round
+            val = x + changes[k]
+            running = val if running is None else max(running, val)
+            row.append(_clean(max(0.0, min(1.0, running))))
+        rows.append(row)
+    return rows
+
+
+def forecast_case(case, params=None):
+    """Map each market id in ``case`` to its forecast rows."""
+    p = _merged(params)
+    case = case or {}
+    markets = list(case.get("markets") or [])
+    horizon = int(case.get("horizon_minutes") or 240)
+    taus = tuple(case.get("quantiles") or volmodel.TAUS)
+
+    # Case-level pooled empirical distribution + activity multipliers.
+    shared_by_id = {}
+    floor = float(p.get("norm_floor") or 0.004)
+    pool_window = int(p.get("pool_window") or 0)
+    if pool_window > 0 and markets:
+        anchors_p, dq_p = volmodel.pooled_change_quantiles(
+            [list(m.get("prices") or []) for m in markets], pool_window, floor)
+        sqrt_p = [math.sqrt(a) if a > 0 else 0.0 for a in anchors_p]
+        act_win = int(p.get("act_window") or 361)
+        acts = [volmodel.activity(list(m.get("prices") or []), act_win, floor)
+                for m in markets]
+        pool_act = sum(acts) / len(acts) if acts else 0.0
+        gamma = float(p.get("act_gamma") or 0.0)
+        clip_lo = float(p.get("act_clip_lo") or 0.4)
+        clip_hi = float(p.get("act_clip_hi") or 2.0)
+        for m, act in zip(markets, acts):
+            prices_m = m.get("prices") or []
+            x_m = float(prices_m[-1]) if prices_m else 0.0
+            if pool_act > 0 and act > 0:
+                g = min(clip_hi, max(clip_lo, math.sqrt(act / pool_act))) ** gamma
+            elif pool_act > 0:
+                g = clip_lo ** gamma
+            else:
+                g = 1.0
+            shared_by_id[m["id"]] = (sqrt_p, dq_p,
+                                     volmodel.level_factor(x_m, floor), g)
+
+    result = {m["id"]: rows_for_market(m.get("prices") or [], horizon=horizon,
+                                       taus=taus, params=p,
+                                       shared=shared_by_id.get(m["id"]))
+              for m in markets}
+
+    shrink = float(p.get("sum_shrink") or 0.0)
+    if shrink > 0 and markets and horizon > 0:
+        ids = [m["id"] for m in markets]
+        s0 = sum(float(m["prices"][-1]) if m.get("prices") else 0.0
+                 for m in markets)
+        med_idx = _MED if len(taus) > _MED else len(taus) // 2
+        for h in range(horizon):
+            med_sum = sum(result[i][h][med_idx] for i in ids)
+            shift = (s0 - med_sum) * shrink / len(ids)
+            if shift == 0.0:
+                continue
+            for i in ids:
+                row = result[i][h]
+                new_med = row[med_idx] + shift
+                if med_idx > 0:  # stay inside this row's neighbours
+                    new_med = max(new_med, row[med_idx - 1])
+                if med_idx + 1 < len(row):
+                    new_med = min(new_med, row[med_idx + 1])
+                row[med_idx] = _clean(max(0.0, min(1.0, new_med)))
+    return result
