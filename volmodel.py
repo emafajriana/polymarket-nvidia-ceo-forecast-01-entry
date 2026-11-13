@@ -34,6 +34,15 @@ market_stats(prices) -> dict with keys:
               the whole series when it is shorter.
     'mean6'   Mean of the last 360 prices (6 h of minutes), or of the
               whole series when it is shorter.
+decayed_sum_target(current_sum, target_inf, tau, h)
+    Target for the sum of all markets' Yes prices at horizon minute
+    ``h``, assuming that sum decays exponentially from ``current_sum``
+    toward ``target_inf`` with time constant ``tau`` (see the function
+    docstring for the formula and edge cases).
+share_weights(last_prices, floor)
+    One weight per price in ``last_prices``, proportional to
+    ``max(price, floor)`` and normalised to sum to 1.0 (see the
+    function docstring for the empty and degenerate-total fallbacks).
 
 An anchor h only qualifies when it yields at least 20 change samples,
 i.e. len(prices) - h >= 20; tiny samples give quantiles that are more
@@ -218,3 +227,77 @@ def activity(prices, window, floor):
     for i in range(1, len(tail)):
         total += abs(tail[i] - tail[i - 1]) / level_factor(tail[i - 1], floor)
     return total / (len(tail) - 1)
+
+
+def decayed_sum_target(current_sum, target_inf, tau, h):
+    """Exponentially decayed target for the sum of Yes prices.
+
+    Cross-market Yes prices need not sum to exactly 1 -- the sum drifts
+    above or below it -- and a forecaster that expects that sum to
+    revert uses this helper for the level it should have reached by
+    horizon minute ``h``:
+
+        target_inf + (current_sum - target_inf) * exp(-h / tau)
+
+    ``current_sum`` is the sum now, ``target_inf`` is the long-run
+    level the sum decays toward, ``tau`` is the decay time constant in
+    minutes, and ``h`` is a non-negative horizon in minutes.  At
+    ``h == 0`` the result is ``current_sum``; as ``h`` grows it
+    approaches ``target_inf``, reaching about 63% of the way there at
+    ``h == tau``.
+
+    If ``tau`` is not positive, is NaN, or cannot be compared as a
+    number at all, there is no meaningful decay rate, so the decay is
+    treated as immediate and ``target_inf`` is returned.  (An infinite
+    ``tau`` is usable: it means no decay, and the formula itself then
+    returns ``current_sum``.)  A negative ``h`` is clamped to 0, i.e.
+    treated as "no time has passed", rather than extrapolating the
+    sum away from ``target_inf``.  The return value is always a float.
+    The function is pure float math: no I/O and no state.
+    """
+    try:
+        unusable = tau <= 0 or math.isnan(tau)
+    except (TypeError, ValueError):
+        unusable = True
+    if unusable:
+        return float(target_inf)
+    horizon = h if h > 0 else 0.0
+    return float(target_inf + (current_sum - target_inf)
+                 * math.exp(-horizon / tau))
+
+
+def share_weights(last_prices, floor):
+    """Normalised weights proportional to ``max(price, floor)``.
+
+    Given one last price per market, returns a list of weights, one
+    per price and in the same order, proportional to
+    ``max(price, floor)`` and normalised so they sum to 1.0.  A
+    cross-market forecaster uses the weights to split a target sum
+    (for example from decayed_sum_target) back across markets.
+
+    ``floor`` is expected to be positive.  It keeps a market whose
+    price is 0.0 -- or very small, or even negative -- in the split
+    with a small positive share instead of dropping it to zero weight:
+    every such price is treated as ``floor`` by the same ``max`` rule.
+
+    An empty input returns an empty list.  If the total of the floored
+    prices is not positive -- which can happen only when ``floor``
+    itself is not positive -- no proportional split exists, so the
+    fallback is uniform weights of ``1 / len(last_prices)`` each.
+    A floored value that is still negative (possible only with a
+    non-positive ``floor`` and a negative price) is clamped to 0.0,
+    so no weight is ever negative.  The input may be any sequence;
+    it is materialised once so its length is known exactly.  The
+    function is pure: no I/O and no state.
+    """
+    prices = list(last_prices)
+    if not prices:
+        return []
+    # max(price, floor) is the share rule; the outer max with 0.0 is a
+    # no-op for a positive floor and only bites in the degenerate
+    # non-positive-floor case, where it keeps weights non-negative.
+    floored = [max(max(price, floor), 0.0) for price in prices]
+    total = sum(floored)
+    if total <= 0:
+        return [1.0 / len(prices)] * len(prices)
+    return [value / total for value in floored]

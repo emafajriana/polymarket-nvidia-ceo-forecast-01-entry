@@ -40,11 +40,29 @@ Parameters (``DEFAULT_PARAMS``):
   sig_floor / sig_cap -- bounds for the effective per-minute sigma.
   mid_scale -- multiplier on 25%/75% deviations from the median.
   tail_scale -- multiplier on 5%/95% deviations from the median.
+  dn_tail_scale -- optional multiplier on the 5% (outer, below the
+    median) deviation; None (default) falls back to ``tail_scale``.
+  dn_mid_scale -- optional multiplier on the 25% (inner, below the
+    median) deviation; None (default) falls back to ``mid_scale``.
+  up_mid_scale -- optional multiplier on the 75% (inner, above the
+    median) deviation; None (default) falls back to ``mid_scale``.
+  up_tail_scale -- optional multiplier on the 95% (outer, above the
+    median) deviation; None (default) falls back to ``tail_scale``.
   med_shrink -- multiplier on the blended median change.
   revert -- strength of median pull toward ``mean24`` (0 = off).
   revert_tau -- minutes; pull grows as ``1 - exp(-h/revert_tau)``.
   drift_cap -- absolute cap on the shaped median change.
   sum_shrink -- cross-market median-sum adjustment (0 = off).
+  sum_target_inf -- long-run target for the sum of last prices
+    across markets; when > 0 (and there are at least 2 markets),
+    every horizon minute's rows are whole-row shifted so their
+    medians sum to a target decaying from the current sum toward
+    this value.  0.0 (default) = feature off.
+  sum_tau -- minutes; decay timescale for that target
+    (``volmodel.decayed_sum_target``).
+  sum_weight_floor -- floor on each market's last price when
+    computing the share weights that split the median-sum gap
+    across markets (``volmodel.share_weights``).
 
 Pure and deterministic: no randomness, no I/O, stdlib only.
 """
@@ -60,8 +78,13 @@ Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
 DEFAULT_PARAMS = {
     "w_emp": 1.0, "sig_blend": 0.5, "sig_floor": 0.0004,
     "sig_cap": 0.02, "mid_scale": 0.62, "tail_scale": 0.62,
-    "med_shrink": 1.0, "revert": 0.0, "revert_tau": 180.0,
+    "dn_tail_scale": 0.56, "dn_mid_scale": 1.15,
+    "up_mid_scale": 0.78, "up_tail_scale": 0.47,
+    "med_shrink": 1.0, "revert": 0.05, "revert_tau": 180.0,
     "drift_cap": 0.05, "sum_shrink": 0.0,
+    # Sum-reversion (forecast_case): whole-row shifts so the median
+    # sum decays from the current price sum toward sum_target_inf.
+    "sum_target_inf": 0.98, "sum_tau": 240.0, "sum_weight_floor": 0.002,
     # Pooled cross-market empirical distribution (forecast_case):
     # changes of every market in the case, level-normalised and pooled,
     # replace each market's own change quantiles as the empirical part.
@@ -184,10 +207,21 @@ def rows_for_market(prices, horizon=240,
         changes[med_idx] = med
 
         # Rescale deviations from the median: near pair vs tails,
-        # times the market's relative-activity multiplier.
+        # times the market's relative-activity multiplier.  A
+        # per-side scale, when set (not None), overrides the shared
+        # mid/tail scale for its side and distance from the median.
         for k in range(n_tau):
             if k != med_idx:
-                scale = p["mid_scale"] if abs(k - med_idx) == 1 else p["tail_scale"]
+                inner = abs(k - med_idx) == 1
+                scale = p["mid_scale"] if inner else p["tail_scale"]
+                if k < med_idx:
+                    side = p.get("dn_mid_scale") if inner \
+                        else p.get("dn_tail_scale")
+                else:
+                    side = p.get("up_mid_scale") if inner \
+                        else p.get("up_tail_scale")
+                if side is not None:
+                    scale = side
                 changes[k] = med + float(scale) * act_mult * (changes[k] - med)
 
         row, running = [], None
@@ -258,4 +292,55 @@ def forecast_case(case, params=None):
                 if med_idx + 1 < len(row):
                     new_med = min(new_med, row[med_idx + 1])
                 row[med_idx] = _clean(max(0.0, min(1.0, new_med)))
+
+    # Sum-reversion: shift whole rows so the sum of medians at each
+    # horizon minute decays from the current price sum toward
+    # sum_target_inf, split across markets by last-price shares.
+    sum_target_inf = float(p.get("sum_target_inf") or 0.0)
+    if sum_target_inf > 0 and len(markets) >= 2 and horizon > 0:
+        ids = [m["id"] for m in markets]
+        last_prices = [float(m["prices"][-1]) if m.get("prices") else 0.0
+                       for m in markets]
+        s0 = sum(last_prices)
+        sum_tau = float(p.get("sum_tau") or 240.0)
+        weight_floor = float(p.get("sum_weight_floor") or 0.002)
+        weights = volmodel.share_weights(last_prices, weight_floor)
+        if weights:
+            if 0.5 in taus:
+                med_idx_sr = taus.index(0.5)
+            else:
+                med_idx_sr = min(range(len(taus)),
+                                 key=lambda i: abs(taus[i] - 0.5))
+            for idx in range(horizon):
+                h = idx + 1  # rows are 0-indexed; minutes are 1-based
+                target = volmodel.decayed_sum_target(
+                    s0, sum_target_inf, sum_tau, h)
+                present = []
+                med_sum = 0.0
+                for pos, i in enumerate(ids):
+                    rows_i = result.get(i)
+                    if not rows_i or idx >= len(rows_i):
+                        continue
+                    row = rows_i[idx]
+                    if not row or med_idx_sr >= len(row):
+                        continue
+                    med_sum += row[med_idx_sr]
+                    present.append(pos)
+                if not present:
+                    continue
+                gap = target - med_sum
+                if gap == 0.0:
+                    continue
+                for pos in present:
+                    if pos >= len(weights):
+                        continue
+                    shift_i = gap * weights[pos]
+                    row = result[ids[pos]][idx]
+                    new_row, running = [], None
+                    for val in row:  # shift, monotonise, clamp, round
+                        val = val + shift_i
+                        running = val if running is None \
+                            else max(running, val)
+                        new_row.append(_clean(max(0.0, min(1.0, running))))
+                    result[ids[pos]][idx] = new_row
     return result
